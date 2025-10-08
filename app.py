@@ -168,9 +168,9 @@ with tab1:
     st.subheader("🎯 目標變數 (Weight) 分佈")
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.hist(df['Weight'], bins=20, color='skyblue', edgecolor='black', alpha=0.7)
-    ax.set_xlabel('體重 (Weight)', fontsize=12)
-    ax.set_ylabel('頻率', fontsize=12)
-    ax.set_title('魚類體重分佈圖', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Weight', fontsize=12)
+    ax.set_ylabel('Frequency', fontsize=12)
+    ax.set_title('Fish Weight Distribution Diagram', fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
     st.pyplot(fig)
     plt.close()
@@ -199,7 +199,7 @@ with tab2:
     
     fig, ax = plt.subplots(figsize=(10, 8))
     sns.heatmap(X_df.corr(), annot=True, fmt='.2f', cmap='coolwarm', center=0, ax=ax)
-    ax.set_title('特徵相關性矩陣', fontsize=14, fontweight='bold')
+    ax.set_title('Correlation Matrix of Features', fontsize=14, fontweight='bold')
     plt.tight_layout()
     st.pyplot(fig)
     plt.close()
@@ -236,8 +236,8 @@ with tab3:
         fig, ax = plt.subplots(figsize=(10, 6))
         colors = ['green' if x != 0 else 'lightgray' for x in coef_df['係數']]
         ax.barh(coef_df['特徵名稱'], coef_df['係數'], color=colors, edgecolor='black')
-        ax.set_xlabel('係數值', fontsize=12)
-        ax.set_title('Lasso 迴歸特徵係數', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Coefficients', fontsize=12)
+        ax.set_title('Lasso Regression Feature Coefficients', fontsize=14, fontweight='bold')
         ax.axvline(x=0, color='black', linestyle='--', linewidth=1)
         ax.grid(True, alpha=0.3, axis='x')
         plt.tight_layout()
@@ -303,16 +303,16 @@ with tab4:
     
     ax1.scatter(y_tr, y_train_pred, alpha=0.6, color='blue', edgecolors='k', s=50)
     ax1.plot([y_tr.min(), y_tr.max()], [y_tr.min(), y_tr.max()], 'r--', lw=2)
-    ax1.set_xlabel('實際值', fontsize=12)
-    ax1.set_ylabel('預測值', fontsize=12)
-    ax1.set_title(f'訓練集 (R²={train_r2:.4f})', fontsize=13, fontweight='bold')
+    ax1.set_xlabel('Ground Truth', fontsize=12)
+    ax1.set_ylabel('Prediction ', fontsize=12)
+    ax1.set_title(f'Training Set (R²={train_r2:.4f})', fontsize=13, fontweight='bold')
     ax1.grid(True, alpha=0.3)
     
     ax2.scatter(y_te, y_test_pred, alpha=0.6, color='green', edgecolors='k', s=50)
     ax2.plot([y_te.min(), y_te.max()], [y_te.min(), y_te.max()], 'r--', lw=2)
-    ax2.set_xlabel('實際值', fontsize=12)
-    ax2.set_ylabel('預測值', fontsize=12)
-    ax2.set_title(f'測試集 (R²={test_r2:.4f})', fontsize=13, fontweight='bold')
+    ax2.set_xlabel('Ground Truth', fontsize=12)
+    ax2.set_ylabel('Prediction ', fontsize=12)
+    ax2.set_title(f'Testing Set (R²={test_r2:.4f})', fontsize=13, fontweight='bold')
     ax2.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -327,16 +327,16 @@ with tab4:
     
     ax1.scatter(y_train_pred, train_residuals, alpha=0.6, color='blue', edgecolors='k', s=50)
     ax1.axhline(y=0, color='r', linestyle='--', lw=2)
-    ax1.set_xlabel('預測值', fontsize=12)
-    ax1.set_ylabel('殘差', fontsize=12)
-    ax1.set_title('訓練集殘差圖', fontsize=13, fontweight='bold')
+    ax1.set_xlabel('Prediction', fontsize=12)
+    ax1.set_ylabel('Residuals ', fontsize=12)
+    ax1.set_title('Training Set Residuals', fontsize=13, fontweight='bold')
     ax1.grid(True, alpha=0.3)
     
     ax2.scatter(y_test_pred, test_residuals, alpha=0.6, color='green', edgecolors='k', s=50)
     ax2.axhline(y=0, color='r', linestyle='--', lw=2)
-    ax2.set_xlabel('預測值', fontsize=12)
-    ax2.set_ylabel('殘差', fontsize=12)
-    ax2.set_title('測試集殘差圖', fontsize=13, fontweight='bold')
+    ax2.set_xlabel('Prediction', fontsize=12)
+    ax2.set_ylabel('Residuals ', fontsize=12)
+    ax2.set_title('Testing Set Residuals', fontsize=13, fontweight='bold')
     ax2.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -386,9 +386,9 @@ with tab5:
             trials_values = [trial.value for trial in study.trials]
             fig, ax = plt.subplots(figsize=(10, 5))
             ax.plot(trials_values, marker='o', linestyle='-', alpha=0.7)
-            ax.set_xlabel('試驗次數', fontsize=12)
-            ax.set_ylabel('目標值 (MSE)', fontsize=12)
-            ax.set_title('優化歷史', fontsize=14, fontweight='bold')
+            ax.set_xlabel('Number of Trials', fontsize=12)
+            ax.set_ylabel('Target Value (MSE)', fontsize=12)
+            ax.set_title('Optimization History', fontsize=14, fontweight='bold')
             ax.grid(True, alpha=0.3)
             st.pyplot(fig)
             plt.close()
@@ -405,9 +405,9 @@ with tab5:
         ax.scatter(trials_df['Alpha'], trials_df['MSE'], alpha=0.6, s=50, edgecolors='k')
         ax.axvline(x=study.best_params['alpha'], color='r', linestyle='--', lw=2, 
                    label=f"最佳 Alpha = {study.best_params['alpha']:.4f}")
-        ax.set_xlabel('Alpha 值', fontsize=12)
+        ax.set_xlabel('Alpha', fontsize=12)
         ax.set_ylabel('MSE', fontsize=12)
-        ax.set_title('Alpha 參數與 MSE 的關係', fontsize=14, fontweight='bold')
+        ax.set_title('Alpha and MSE relationship', fontsize=14, fontweight='bold')
         ax.set_xscale('log')
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -436,9 +436,9 @@ with tab5:
         
         col1, col2 = st.columns(2)
         with col1:
-            st.metric("R² 改善", f"{improvement_r2:+.2f}%")
+            st.metric("R² Improvement", f"{improvement_r2:+.2f}%")
         with col2:
-            st.metric("MSE 改善", f"{improvement_mse:+.2f}%")
+            st.metric("MSE Improvement", f"{improvement_mse:+.2f}%")
 
 # Tab 6: 模型部署
 with tab6:
