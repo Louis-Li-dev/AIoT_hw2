@@ -2,7 +2,7 @@
 
 > 本文件針對你提供的 `Streamlit` 應用程式進行**關鍵程式碼擷取**與**逐行說明**，並以 **CRISP-DM** 步驟撰寫。文末補充常見錯誤與修正建議（含資料路徑小陷阱）。
 > Demo Link [https://aiot-hw2.streamlit.app/](https://aiot-hw2.streamlit.app/)
-
+> GPT Prompt Link [https://chatgpt.com/share/68e5cf49-d8d0-8013-b6b4-984a12600050](https://chatgpt.com/share/68e5cf49-d8d0-8013-b6b4-984a12600050)
 ---
 
 ## 🔗 資料集連結（Fish Market Dataset）
