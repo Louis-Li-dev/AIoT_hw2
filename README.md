@@ -1,7 +1,7 @@
 # 房價預測（Ames Housing）—多元線性回歸（OLS）報告（**Streamlit 版**）
 
 > **目標**：以可重現、低延遲的 **單檔 Streamlit** 介面完成從資料理解到建模與評估的 **CRISP-DM** 流程，並在可解釋性前提下達到穩定的驗證表現。
-
+Deployement: [https://aiot-hw2.streamlit.app/](https://aiot-hw2.streamlit.app/)
 ---
 
 ## 1. 資料來源
