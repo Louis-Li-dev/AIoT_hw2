@@ -1,559 +1,361 @@
-"""
-魚類體重預測系統 - 使用 Lasso 迴歸與 Optuna 超參數優化
-Fish Weight Prediction System using Lasso Regression with Optuna
-
-作業要求：
-1. 使用 chatGPT 工具利用 CRISP-DM 模板解決多元回歸 Regression Problem
-2. Step 1: 爬蟲抓取 Boston 房價 (本專案改用魚類資料集)
-3. Step 2: Preprocessing: train test split
-4. Step 3: Build Model using Lasso
-5. Step 4: Evaluation: MSE, MAE, R2 metrics 的意義, overfit and underfit 的判斷, 優化模型 Optuna
-6. Step 5: Deployment
-
-執行方式: streamlit run app.py
-"""
+# app.py
+# -*- coding: utf-8 -*-
+#
+# 房屋價格預測 Streamlit 應用（現代化 UI + 三分頁）：
+# - 讀取 dataset/train.csv 與 dataset/test.csv（固定路徑）
+# - 目標：SalePrice
+# - 缺值策略：>50% 缺值之欄位刪除；其餘數值以中位數、類別以眾數
+# - 特徵工程：One-Hot（類別）+ 標準化（數值）
+# - 特徵選擇：KBest(f_regression) 或 L1/Lasso（自動 α）
+# - 模型：statsmodels OLS（提供 95% CI/PI）；失敗則退回 sklearn LinearRegression 並以殘差近似區間
+#
+# 執行：
+#   streamlit run app.py
+#
+from pathlib import Path
+import io
+import time
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 import streamlit as st
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.linear_model import Lasso
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import matplotlib.pyplot as plt
-import seaborn as sns
-import optuna
-from optuna.visualization.matplotlib import plot_optimization_history, plot_param_importances
-import warnings
-warnings.filterwarnings('ignore')
 
-# 設定中文字型
-plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'Microsoft JhengHei', 'SimHei', 'DejaVu Sans']
-plt.rcParams['axes.unicode_minus'] = False
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.linear_model import LassoCV, LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from scipy import sparse
+import statsmodels.api as sm
 
-# 設定頁面配置
-st.set_page_config(page_title="魚類體重預測系統", page_icon="🐟", layout="wide")
 
-# PATH 變數設定
-PATH = "./dataset/Fishers maket.csv"
+# ──────────────────────────────────────────────────────────────────────────────
+# 基本設定
+# ──────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="房屋價格預測 — 多元線性回歸",
+    page_icon="🏠",
+    layout="wide"
+)
 
-# 標題
-st.title("🐟 魚類體重預測系統 - Lasso 迴歸分析")
-st.markdown("### 使用 CRISP-DM 方法論與 Optuna 超參數優化")
-st.markdown("---")
+DEFAULT_TARGET = "SalePrice"
+BASE_DIR = Path(__file__).resolve().parent
+TRAIN_PATH = BASE_DIR / "dataset" / "train.csv"
+TEST_PATH  = BASE_DIR / "dataset" / "test.csv"
 
-# 側邊欄參數設定
-st.sidebar.header("🎛️ 參數設定")
-st.sidebar.subheader("📊 資料分割參數")
-test_size = st.sidebar.slider("測試集比例", 0.1, 0.4, 0.2, 0.05)
-random_state = st.sidebar.number_input("隨機種子", 1, 100, 42)
-
-st.sidebar.subheader("🤖 模型參數")
-use_optuna = st.sidebar.checkbox("使用 Optuna 優化", value=False)
-
-if not use_optuna:
-    alpha = st.sidebar.slider("Alpha (正則化強度)", 0.01, 10.0, 1.0, 0.1)
-else:
-    st.sidebar.info("✨ Optuna 將自動尋找最佳 Alpha 值")
-    n_trials = st.sidebar.slider("Optuna 試驗次數", 10, 200, 50, 10)
-
-# 載入資料
-@st.cache_data
-def load_data(file_path):
-    try:
-        df = pd.read_csv(file_path)
-        return df, None
-    except Exception as e:
-        return None, str(e)
-
-df, error = load_data(PATH)
-
-if error:
-    st.error(f"❌ {error}")
+# 環境健檢（不要求上傳；固定讀取路徑）
+if not TRAIN_PATH.exists() or not TEST_PATH.exists():
+    st.error("找不到資料檔。請建立 `dataset/` 資料夾並放入 `train.csv` 與 `test.csv`。")
     st.stop()
 
-# 資料預處理
-@st.cache_data
-def preprocess_data(dataframe, test_sz, rand_state):
-    X = dataframe.drop('Weight', axis=1)
-    y = dataframe['Weight']
-    
-    if 'Species' in X.columns:
-        X = pd.get_dummies(X, columns=['Species'], drop_first=True)
-    
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_sz, random_state=rand_state
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 資料載入與快取
+# ──────────────────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def load_csvs():
+    train_raw = pd.read_csv(TRAIN_PATH)
+    test_raw  = pd.read_csv(TEST_PATH)
+    return train_raw, test_raw
+
+@st.cache_data(show_spinner=False)
+def clean_data(df: pd.DataFrame):
+    """智慧缺值處理：
+    - 缺值比例 > 50%：整欄刪除
+    - 其餘：數值→中位數；類別→眾數（若無則 'Unknown'）
+    備註：不在此處丟棄 target 欄位
+    """
+    df = df.copy()
+    missing_ratio = df.isnull().sum() / len(df)
+    cols_to_drop = missing_ratio[missing_ratio > 0.5].index.tolist()
+    df = df.drop(columns=cols_to_drop)
+
+    for col in df.columns:
+        if df[col].isnull().sum() > 0:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].fillna(df[col].median())
+            else:
+                mode = df[col].mode()
+                fillv = mode.iloc[0] if not mode.empty else "Unknown"
+                df[col] = df[col].fillna(fillv)
+    return df, cols_to_drop
+
+def _make_ohe():
+    """為了兼容不同版本 scikit-learn 的 OneHotEncoder 參數差異。"""
+    try:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        # 舊版 API
+        return OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+def prepare_features(df: pd.DataFrame, target: str):
+    """分離特徵與目標、建立 ColumnTransformer。"""
+    y = df[target].astype(float)
+    X = df.drop(columns=[target])
+
+    num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+    cat_cols = [c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])]
+
+    pre = ColumnTransformer(
+        transformers=[
+            ("num", StandardScaler(with_mean=True, with_std=True), num_cols),
+            ("cat", _make_ohe(), cat_cols),
+        ],
+        remainder="drop",
     )
-    
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-    
-    return X_train_scaled, X_test_scaled, y_train, y_test, scaler, X.columns
+    return X, y, pre, num_cols, cat_cols
 
-X_train, X_test, y_train, y_test, scaler, feature_names = preprocess_data(df, test_size, random_state)
+def fig_to_png(fig):
+    """Matplotlib 圖轉 PNG bytes。"""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=160)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
 
-# Optuna 優化函數
-def objective(trial, X_tr, y_tr):
-    alpha_param = trial.suggest_float('alpha', 0.001, 10.0, log=True)
-    model = Lasso(alpha=alpha_param, random_state=42, max_iter=10000)
-    scores = cross_val_score(model, X_tr, y_tr, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
-    return -scores.mean()
 
-@st.cache_resource
-def optimize_with_optuna(X_tr, y_tr, n_trials_param):
-    study = optuna.create_study(direction='minimize', study_name='lasso_optimization')
-    study.optimize(lambda trial: objective(trial, X_tr, y_tr), n_trials=n_trials_param, show_progress_bar=False)
-    return study
+# ──────────────────────────────────────────────────────────────────────────────
+# 訓練與評估主流程（可呼叫）
+# ──────────────────────────────────────────────────────────────────────────────
+def train_and_evaluate(df_clean: pd.DataFrame, *,
+                       test_size: float,
+                       seed: int,
+                       feat_sel: str,
+                       k: int,
+                       target: str = DEFAULT_TARGET):
+    if target not in df_clean.columns:
+        raise ValueError(f"目標欄位「{target}」不存在於資料集中。")
 
-# 訓練模型
-@st.cache_resource
-def train_lasso_model(X_tr, y_tr, alpha_param):
-    model = Lasso(alpha=alpha_param, random_state=42, max_iter=10000)
-    model.fit(X_tr, y_tr)
-    return model
+    X, y, pre, num_cols, cat_cols = prepare_features(df_clean, target)
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=test_size, random_state=seed)
 
-# 模型評估函數
-def evaluate_model(model, X_tr, X_te, y_tr, y_te):
-    y_train_pred = model.predict(X_tr)
-    y_test_pred = model.predict(X_te)
-    
+    # fit/transform
+    pre.fit(Xtr)
+    Xtr_t = pre.transform(Xtr)
+    Xte_t = pre.transform(Xte)
+
+    # 回推特徵名稱（數值 + OHE 後）
+    feat_names = []
+    if num_cols:
+        feat_names += num_cols
+    if cat_cols:
+        ohe = pre.named_transformers_["cat"]
+        try:
+            feat_names += list(ohe.get_feature_names_out(cat_cols))
+        except Exception:
+            feat_names += [f"{c}" for c in cat_cols]
+
+    # 稠密化
+    Xtr_d = Xtr_t.toarray() if sparse.issparse(Xtr_t) else np.asarray(Xtr_t)
+    Xte_d = Xte_t.toarray() if sparse.issparse(Xte_t) else np.asarray(Xte_t)
+
+    # 特徵選擇
+    selected_idx = np.arange(Xtr_d.shape[1])
+    feat_sel_desc = "不進行特徵選擇"
+
+    if feat_sel == "kbest":
+        k_use = max(1, min(int(k), Xtr_d.shape[1]))
+        skb = SelectKBest(score_func=f_regression, k=k_use)
+        skb.fit(Xtr_d, ytr.values)
+        selected_idx = np.where(skb.get_support())[0]
+        feat_sel_desc = f"KBest (K={k_use})"
+
+    elif feat_sel == "lasso":
+        lasso = LassoCV(cv=5, random_state=seed, n_alphas=100, max_iter=5000)
+        lasso.fit(Xtr_d, ytr.values)
+        nz = np.where(np.abs(lasso.coef_) > 1e-8)[0]
+        if len(nz) == 0:
+            # 萬一全 0，保底取 |coef| 最大的 10 個
+            k_fb = max(1, min(10, Xtr_d.shape[1]))
+            nz = np.argsort(np.abs(lasso.coef_))[-k_fb:]
+        selected_idx = np.sort(nz)
+        feat_sel_desc = f"L1/Lasso（{len(selected_idx)} features）"
+
+    # 篩選後資料
+    Xtr_s = Xtr_d[:, selected_idx]
+    Xte_s = Xte_d[:, selected_idx]
+    feat_names_s = [feat_names[i] if i < len(feat_names) else f"f_{i}" for i in selected_idx]
+
+    # OLS 擬合與區間
+    Xtr_sm = sm.add_constant(Xtr_s)
+    Xte_sm = sm.add_constant(Xte_s)
+
+    ols = sm.OLS(ytr.values, Xtr_sm).fit()
+
+    try:
+        pred = ols.get_prediction(Xte_sm).summary_frame(alpha=0.05)
+        yhat = pred["mean"].values
+        ci_lo = pred["mean_ci_lower"].values
+        ci_hi = pred["mean_ci_upper"].values
+        pi_lo = pred["obs_ci_lower"].values
+        pi_hi = pred["obs_ci_upper"].values
+    except Exception:
+        # 退回 sklearn 線性回歸並以殘差近似 CI/PI（視覺用）
+        lr = LinearRegression()
+        lr.fit(Xtr_s, ytr.values)
+        yhat = lr.predict(Xte_s)
+        resid = yte.values - yhat
+        std = float(np.std(resid))
+        ci_lo = yhat - 1.96 * std
+        ci_hi = yhat + 1.96 * std
+        pi_lo = yhat - 1.96 * std * 1.5
+        pi_hi = yhat + 1.96 * std * 1.5
+        # 讓係數可用（擬造 params）
+        ols.params = np.concatenate([[lr.intercept_], lr.coef_])
+
+    # 指標
+    mae = mean_absolute_error(yte.values, yhat)
+    rmse = mean_squared_error(yte.values, yhat, squared=False)
+    r2 = r2_score(yte.values, yhat)
+
+    # Top-10 係數
+    coefs = np.array(ols.params[1:])  # 跳過截距
+    names = feat_names_s if len(feat_names_s) == len(coefs) else [f"feature_{i}" for i in range(len(coefs))]
+    if len(coefs) > 0 and np.any(np.isfinite(coefs)):
+        order = np.argsort(-np.abs(coefs))
+        top = [(i + 1, names[idx], float(coefs[idx])) for i, idx in enumerate(order[: min(10, len(coefs))])]
+    else:
+        top = [(1, "N/A", 0.0)]
+
+    # 視覺化：Predicted vs Actual（排序以便觀察趨勢）
+    order_idx = np.argsort(yte.values)
+    y_true = yte.values[order_idx]
+    y_pred = yhat[order_idx]
+    ci_lo_s, ci_hi_s = ci_lo[order_idx], ci_hi[order_idx]
+    pi_lo_s, pi_hi_s = pi_lo[order_idx], pi_hi[order_idx]
+
+    fig = plt.figure(figsize=(8.5, 6.2))
+    ax = fig.add_subplot(111)
+    ax.fill_between(range(len(y_true)), pi_lo_s, pi_hi_s, alpha=0.12, label="95% Prediction Interval")
+    ax.fill_between(range(len(y_true)), ci_lo_s, ci_hi_s, alpha=0.20, label="95% Confidence Interval")
+    ax.plot(range(len(y_true)), y_true, lw=2, label="Actual", marker="o", markersize=3, alpha=0.75)
+    ax.plot(range(len(y_true)), y_pred, lw=2, label="Predicted", marker="s", markersize=3, alpha=0.75)
+    ax.set_title("Predicted vs Actual (with 95% CI / PI)", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Validation Samples (sorted by Actual)")
+    ax.set_ylabel("SalePrice")
+    ax.grid(True, alpha=0.15, linestyle="--")
+    ax.legend(loc="best", fontsize=9, framealpha=0.95)
+    fig.tight_layout()
+
     return {
-        'train': {
-            'mse': mean_squared_error(y_tr, y_train_pred),
-            'mae': mean_absolute_error(y_tr, y_train_pred),
-            'r2': r2_score(y_tr, y_train_pred)
-        },
-        'test': {
-            'mse': mean_squared_error(y_te, y_test_pred),
-            'mae': mean_absolute_error(y_te, y_test_pred),
-            'r2': r2_score(y_te, y_test_pred)
-        },
-        'predictions': {
-            'train': (y_tr, y_train_pred),
-            'test': (y_te, y_test_pred)
-        }
+        "n_train": int(Xtr_s.shape[0]),
+        "n_test": int(Xte_s.shape[0]),
+        "n_features": int(Xtr_s.shape[1]),
+        "target": target,
+        "feat_sel_desc": feat_sel_desc,
+        "mae": float(mae),
+        "rmse": float(rmse),
+        "r2": float(r2),
+        "top_coefs": top,
+        "figure": fig,
     }
 
-# 主要 Tabs
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📊 Step 1: 資料載入", 
-    "⚙️ Step 2: 資料預處理",
-    "🤖 Step 3: 模型建立",
-    "📈 Step 4: 模型評估",
-    "✨ Step 4+: Optuna 優化",
-    "🚀 Step 5: 模型部署"
-])
 
-# Tab 1: 資料載入
-with tab1:
-    st.header("📊 Step 1: 資料載入")
-    st.markdown("**CRISP-DM 階段**: Business Understanding & Data Understanding")
-    st.success(f"✅ 成功載入資料！檔案路徑: {PATH}")
-    
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        st.subheader("📋 資料預覽")
-        st.dataframe(df.head(15), use_container_width=True)
-    
-    with col2:
-        st.subheader("📊 資料資訊")
-        st.metric("總樣本數", len(df))
-        st.metric("特徵數量", len(df.columns) - 1)
-        st.metric("缺失值總數", df.isnull().sum().sum())
-    
-    st.subheader("📈 描述性統計")
-    st.dataframe(df.describe(), use_container_width=True)
-    
-    st.subheader("🎯 目標變數 (Weight) 分佈")
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.hist(df['Weight'], bins=20, color='skyblue', edgecolor='black', alpha=0.7)
-    ax.set_xlabel('Weight', fontsize=12)
-    ax.set_ylabel('Frequency', fontsize=12)
-    ax.set_title('Fish Weight Distribution Diagram', fontsize=14, fontweight='bold')
-    ax.grid(True, alpha=0.3)
-    st.pyplot(fig)
-    plt.close()
-
-# Tab 2: 資料預處理
-with tab2:
-    st.header("⚙️ Step 2: 資料預處理與分割")
-    st.markdown("**CRISP-DM 階段**: Data Preparation")
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("訓練集樣本數", len(X_train))
-    with col2:
-        st.metric("測試集樣本數", len(X_test))
-    with col3:
-        st.metric("特徵數量（編碼後）", X_train.shape[1])
-    
-    st.success("✅ 資料預處理完成！")
-    
-    st.subheader("📋 處理後的特徵列表")
-    st.write(list(feature_names))
-    
-    st.subheader("🔥 特徵相關性熱圖")
-    X_df = pd.DataFrame(X_train, columns=feature_names)
-    X_df['Weight'] = y_train.values
-    
-    fig, ax = plt.subplots(figsize=(10, 8))
-    sns.heatmap(X_df.corr(), annot=True, fmt='.2f', cmap='coolwarm', center=0, ax=ax)
-    ax.set_title('Correlation Matrix of Features', fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close()
-
-# Tab 3: 模型建立
-with tab3:
-    st.header("🤖 Step 3: 建立模型 - Lasso 迴歸")
-    st.markdown("**CRISP-DM 階段**: Modeling")
-    
-    if use_optuna:
-        st.info("🔄 使用 Optuna 尋找最佳 Alpha 值...")
-        with st.spinner("正在優化超參數..."):
-            study = optimize_with_optuna(X_train, y_train, n_trials)
-            best_alpha = study.best_params['alpha']
-            st.success(f"✅ Optuna 優化完成！最佳 Alpha = {best_alpha:.6f}")
-        
-        model = train_lasso_model(X_train, y_train, best_alpha)
-        current_alpha = best_alpha
-    else:
-        model = train_lasso_model(X_train, y_train, alpha)
-        current_alpha = alpha
-        st.success(f"✅ Lasso 模型訓練完成！Alpha = {current_alpha}")
-    
-    st.subheader("📊 特徵係數")
-    coef_df = pd.DataFrame({
-        '特徵名稱': feature_names,
-        '係數': model.coef_,
-        '絕對值': np.abs(model.coef_)
-    }).sort_values('絕對值', ascending=False)
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        fig, ax = plt.subplots(figsize=(10, 6))
-        colors = ['green' if x != 0 else 'lightgray' for x in coef_df['係數']]
-        ax.barh(coef_df['特徵名稱'], coef_df['係數'], color=colors, edgecolor='black')
-        ax.set_xlabel('Coefficients', fontsize=12)
-        ax.set_title('Lasso Regression Feature Coefficients', fontsize=14, fontweight='bold')
-        ax.axvline(x=0, color='black', linestyle='--', linewidth=1)
-        ax.grid(True, alpha=0.3, axis='x')
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
-    
-    with col2:
-        st.dataframe(coef_df, use_container_width=True, height=400)
-    
-    non_zero = np.sum(model.coef_ != 0)
-    total = len(model.coef_)
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("保留特徵數", non_zero)
-    with col2:
-        st.metric("排除特徵數", total - non_zero)
-    with col3:
-        st.metric("特徵保留率", f"{non_zero/total*100:.1f}%")
-
-# Tab 4: 模型評估
-with tab4:
-    st.header("📈 Step 4: 模型評估")
-    st.markdown("**CRISP-DM 階段**: Evaluation")
-    
-    metrics = evaluate_model(model, X_train, X_test, y_train, y_test)
-    
-    st.subheader("📊 評估指標結果")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.write("### 🔵 訓練集 (Training Set)")
-        st.metric("MSE", f"{metrics['train']['mse']:.2f}")
-        st.metric("MAE", f"{metrics['train']['mae']:.2f}")
-        st.metric("R²", f"{metrics['train']['r2']:.4f}")
-    
-    with col2:
-        st.write("### 🟢 測試集 (Test Set)")
-        st.metric("MSE", f"{metrics['test']['mse']:.2f}")
-        st.metric("MAE", f"{metrics['test']['mae']:.2f}")
-        st.metric("R²", f"{metrics['test']['r2']:.4f}")
-    
-    st.subheader("🔍 模型診斷 - Overfit/Underfit 判斷")
-    
-    train_r2 = metrics['train']['r2']
-    test_r2 = metrics['test']['r2']
-    r2_diff = train_r2 - test_r2
-    
-    if r2_diff > 0.15 and train_r2 > 0.7:
-        st.warning(f"**⚠️ 偵測到過擬合 (Overfit)！** 訓練 R²={train_r2:.4f}, 測試 R²={test_r2:.4f}, 差異={r2_diff:.4f}")
-    elif train_r2 < 0.5 and test_r2 < 0.5:
-        st.warning(f"**⚠️ 偵測到欠擬合 (Underfit)！** 訓練 R²={train_r2:.4f}, 測試 R²={test_r2:.4f}")
-    else:
-        st.success(f"**✅ 模型表現良好！** 訓練 R²={train_r2:.4f}, 測試 R²={test_r2:.4f}, 差異={r2_diff:.4f}")
-    
-    st.subheader("📉 預測結果視覺化")
-    
-    y_tr, y_train_pred = metrics['predictions']['train']
-    y_te, y_test_pred = metrics['predictions']['test']
-    
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    
-    ax1.scatter(y_tr, y_train_pred, alpha=0.6, color='blue', edgecolors='k', s=50)
-    ax1.plot([y_tr.min(), y_tr.max()], [y_tr.min(), y_tr.max()], 'r--', lw=2)
-    ax1.set_xlabel('Ground Truth', fontsize=12)
-    ax1.set_ylabel('Prediction ', fontsize=12)
-    ax1.set_title(f'Training Set (R²={train_r2:.4f})', fontsize=13, fontweight='bold')
-    ax1.grid(True, alpha=0.3)
-    
-    ax2.scatter(y_te, y_test_pred, alpha=0.6, color='green', edgecolors='k', s=50)
-    ax2.plot([y_te.min(), y_te.max()], [y_te.min(), y_te.max()], 'r--', lw=2)
-    ax2.set_xlabel('Ground Truth', fontsize=12)
-    ax2.set_ylabel('Prediction ', fontsize=12)
-    ax2.set_title(f'Testing Set (R²={test_r2:.4f})', fontsize=13, fontweight='bold')
-    ax2.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close()
-    
-    st.subheader("📊 殘差分析")
-    train_residuals = y_tr - y_train_pred
-    test_residuals = y_te - y_test_pred
-    
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    
-    ax1.scatter(y_train_pred, train_residuals, alpha=0.6, color='blue', edgecolors='k', s=50)
-    ax1.axhline(y=0, color='r', linestyle='--', lw=2)
-    ax1.set_xlabel('Prediction', fontsize=12)
-    ax1.set_ylabel('Residuals ', fontsize=12)
-    ax1.set_title('Training Set Residuals', fontsize=13, fontweight='bold')
-    ax1.grid(True, alpha=0.3)
-    
-    ax2.scatter(y_test_pred, test_residuals, alpha=0.6, color='green', edgecolors='k', s=50)
-    ax2.axhline(y=0, color='r', linestyle='--', lw=2)
-    ax2.set_xlabel('Prediction', fontsize=12)
-    ax2.set_ylabel('Residuals ', fontsize=12)
-    ax2.set_title('Testing Set Residuals', fontsize=13, fontweight='bold')
-    ax2.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close()
-
-# Tab 5: Optuna 優化
-with tab5:
-    st.header("✨ Step 4+: 使用 Optuna 優化模型")
-    
-    st.markdown("""
-    **什麼是 Optuna？**
-    
-    Optuna 是一個自動化超參數優化框架，可以幫助我們找到最佳的模型參數。
-    
-    ### Optuna 的優勢：
-    - 🎯 **自動化搜尋**: 自動探索參數空間
-    - 📊 **高效率**: 使用 TPE 演算法，比網格搜尋更快
-    - 📈 **視覺化**: 提供豐富的視覺化工具
-    """)
-    
-    if not use_optuna:
-        st.info("💡 請在左側邊欄勾選「使用 Optuna 優化」來啟用超參數優化功能")
-    else:
-        st.success(f"✅ Optuna 優化已啟用！已完成 {n_trials} 次試驗")
-        
-        st.subheader("🏆 最佳參數")
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("最佳 Alpha", f"{study.best_params['alpha']:.6f}")
-        with col2:
-            st.metric("最佳 MSE", f"{study.best_value:.2f}")
-        with col3:
-            st.metric("完成試驗數", len(study.trials))
-        
-        st.subheader("📈 優化歷史")
-        try:
-            fig = plot_optimization_history(study)
-            fig.set_figwidth(10)
-            fig.set_figheight(5)
-            st.pyplot(fig)
-            plt.close()
-        except Exception as e:
-            st.warning(f"無法顯示優化歷史圖: {str(e)}")
-            # 手動繪製優化歷史
-            trials_values = [trial.value for trial in study.trials]
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.plot(trials_values, marker='o', linestyle='-', alpha=0.7)
-            ax.set_xlabel('Number of Trials', fontsize=12)
-            ax.set_ylabel('Target Value (MSE)', fontsize=12)
-            ax.set_title('Optimization History', fontsize=14, fontweight='bold')
-            ax.grid(True, alpha=0.3)
-            st.pyplot(fig)
-            plt.close()
-        
-        st.subheader("📊 所有試驗結果")
-        trials_df = study.trials_dataframe()
-        trials_df = trials_df[['number', 'value', 'params_alpha', 'state']]
-        trials_df.columns = ['試驗編號', 'MSE', 'Alpha', '狀態']
-        trials_df = trials_df.sort_values('MSE')
-        st.dataframe(trials_df.head(20), use_container_width=True)
-        
-        st.subheader("📊 Alpha 參數分佈")
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.scatter(trials_df['Alpha'], trials_df['MSE'], alpha=0.6, s=50, edgecolors='k')
-        ax.axvline(x=study.best_params['alpha'], color='r', linestyle='--', lw=2, 
-                   label=f"最佳 Alpha = {study.best_params['alpha']:.4f}")
-        ax.set_xlabel('Alpha', fontsize=12)
-        ax.set_ylabel('MSE', fontsize=12)
-        ax.set_title('Alpha and MSE relationship', fontsize=14, fontweight='bold')
-        ax.set_xscale('log')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close()
-        
-        st.subheader("⚖️ 優化效果比較")
-        default_model = train_lasso_model(X_train, y_train, 1.0)
-        default_metrics = evaluate_model(default_model, X_train, X_test, y_train, y_test)
-        
-        comparison_df = pd.DataFrame({
-            '模型': ['預設 Alpha (1.0)', f'Optuna 最佳 Alpha ({study.best_params["alpha"]:.4f})'],
-            '訓練集 R²': [default_metrics['train']['r2'], metrics['train']['r2']],
-            '測試集 R²': [default_metrics['test']['r2'], metrics['test']['r2']],
-            '測試集 MSE': [default_metrics['test']['mse'], metrics['test']['mse']],
-            '測試集 MAE': [default_metrics['test']['mae'], metrics['test']['mae']]
-        })
-        
-        st.dataframe(comparison_df, use_container_width=True)
-        
-        improvement_r2 = ((metrics['test']['r2'] - default_metrics['test']['r2']) / 
-                         abs(default_metrics['test']['r2']) * 100)
-        improvement_mse = ((default_metrics['test']['mse'] - metrics['test']['mse']) / 
-                          default_metrics['test']['mse'] * 100)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("R² Improvement", f"{improvement_r2:+.2f}%")
-        with col2:
-            st.metric("MSE Improvement", f"{improvement_mse:+.2f}%")
-
-# Tab 6: 模型部署
-with tab6:
-    st.header("🚀 Step 5: 模型部署")
-    st.markdown("**CRISP-DM 階段**: Deployment")
-    
-    deploy_tab1, deploy_tab2 = st.tabs(["🎯 即時預測", "📤 批次預測"])
-    
-    with deploy_tab1:
-        st.subheader("🎯 即時預測工具")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            length1 = st.number_input("Length1", 0.0, 100.0, 25.0, 0.1)
-            length2 = st.number_input("Length2", 0.0, 100.0, 27.0, 0.1)
-        
-        with col2:
-            length3 = st.number_input("Length3", 0.0, 100.0, 32.0, 0.1)
-            height = st.number_input("Height", 0.0, 50.0, 12.0, 0.1)
-        
-        with col3:
-            width = st.number_input("Width", 0.0, 20.0, 4.5, 0.1)
-            species = st.selectbox("Species", df['Species'].unique())
-        
-        if st.button("🔮 進行預測", type="primary"):
-            input_data = pd.DataFrame({
-                'Length1': [length1], 'Length2': [length2], 'Length3': [length3],
-                'Height': [height], 'Width': [width], 'Species': [species]
-            })
-            
-            input_encoded = pd.get_dummies(input_data, columns=['Species'], drop_first=True)
-            for col in feature_names:
-                if col not in input_encoded.columns:
-                    input_encoded[col] = 0
-            input_encoded = input_encoded[feature_names]
-            
-            input_scaled = scaler.transform(input_encoded)
-            prediction = model.predict(input_scaled)[0]
-            
-            st.success(f"### 🎯 預測結果: **{prediction:.2f} 克**")
-            
-            confidence_interval = metrics['test']['mae'] * 1.96
-            st.info(f"📊 95% 信賴區間: **{prediction - confidence_interval:.2f} ~ {prediction + confidence_interval:.2f} 克**")
-    
-    with deploy_tab2:
-        st.subheader("📤 批次預測工具")
-        uploaded_file = st.file_uploader("上傳 CSV 檔案", type=['csv'])
-        
-        if uploaded_file is not None:
-            batch_df = pd.read_csv(uploaded_file)
-            st.dataframe(batch_df.head(), use_container_width=True)
-            
-            if st.button("🚀 開始批次預測", type="primary"):
-                has_weight = 'Weight' in batch_df.columns
-                X_batch = batch_df.drop('Weight', axis=1) if has_weight else batch_df.copy()
-                
-                if 'Species' in X_batch.columns:
-                    X_batch_encoded = pd.get_dummies(X_batch, columns=['Species'], drop_first=True)
-                else:
-                    X_batch_encoded = X_batch.copy()
-                
-                for col in feature_names:
-                    if col not in X_batch_encoded.columns:
-                        X_batch_encoded[col] = 0
-                
-                X_batch_encoded = X_batch_encoded[feature_names]
-                X_batch_scaled = scaler.transform(X_batch_encoded)
-                predictions = model.predict(X_batch_scaled)
-                
-                results_df = batch_df.copy()
-                results_df['預測體重'] = predictions
-                
-                st.success(f"✅ 批次預測完成！共 {len(predictions)} 筆")
-                st.dataframe(results_df, use_container_width=True)
-                
-                csv = results_df.to_csv(index=False).encode('utf-8-sig')
-                st.download_button("📥 下載結果", csv, "predictions.csv", "text/csv", type="primary")
-
-# 頁尾總結
+# ──────────────────────────────────────────────────────────────────────────────
+# 頁面 UI
+# ──────────────────────────────────────────────────────────────────────────────
+st.markdown(
+    "<h1 style='margin-bottom:0'>房屋價格預測</h1>"
+    "<div style='color:#64748b;margin-top:4px'>Multiple Linear Regression with Advanced Feature Selection</div>",
+    unsafe_allow_html=True
+)
 st.markdown("---")
-st.header("📝 專案總結")
 
-col1, col2 = st.columns(2)
+# 載入與清理
+train_raw, test_raw = load_csvs()
+train_clean, dropped_cols = clean_data(train_raw.copy())
+test_clean, _ = clean_data(test_raw.copy())
 
-with col1:
-    st.markdown(f"""
-    ### ✅ 完成項目
-    
-    - ✅ 載入 {len(df)} 筆魚類資料
-    - ✅ 資料預處理與分割
-    - ✅ Lasso 迴歸模型 (Alpha={current_alpha:.6f})
-    - ✅ 保留 {np.sum(model.coef_ != 0)}/{len(model.coef_)} 個特徵
-    - ✅ {'Optuna 超參數優化' if use_optuna else '手動參數設定'}
-    """)
+# 快速統計
+train_n_rows, n_cols = train_clean.shape
+test_n_rows = test_clean.shape[0]
 
-with col2:
-    st.markdown(f"""
-    ### 📊 模型效能
-    
-    - 訓練集 R² = {metrics['train']['r2']:.4f}
-    - 測試集 R² = {metrics['test']['r2']:.4f}
-    - 測試集 MAE = {metrics['test']['mae']:.2f} 克
-    - 最重要特徵: {coef_df.iloc[0]['特徵名稱']}
-    """)
+# Tabs
+tab_preview, tab_train, tab_results = st.tabs(["📄 資料預覽", "⚙️ 訓練設定", "📈 訓練結果"])
 
-st.balloons()
-st.success("🎉 專案完成！感謝使用本系統！")
+with tab_preview:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("訓練樣本", f"{train_n_rows:,}")
+    c2.metric("測試樣本", f"{test_n_rows:,}")
+    c3.metric("特徵欄位數", f"{n_cols:,}")
+    c4.metric("預測目標", DEFAULT_TARGET)
 
-st.sidebar.markdown("---")
-st.sidebar.info("""
-### 💡 使用提示
+    st.success("已完成缺值清理；>50% 缺值欄位已刪除並記錄。")
+    st.caption(f"刪除欄位數（>50% 缺值）：{len(dropped_cols)}")
+    with st.expander("查看被刪欄位名稱", expanded=False):
+        if len(dropped_cols) == 0:
+            st.write("（無）")
+        else:
+            st.write(dropped_cols)
 
-1. 調整參數後模型自動重新訓練
-2. 使用 Optuna 找到最佳 Alpha
-3. 切換 Tab 查看各步驟
-4. 在「模型部署」進行預測
-""")
+    st.subheader("訓練資料前 10 列")
+    st.dataframe(train_clean.head(10), use_container_width=True)
+
+with tab_train:
+    st.subheader("訓練配置")
+    colA, colB, colC, colD = st.columns([1, 1, 1, 1])
+    with colA:
+        test_size = st.selectbox("驗證集比例", options=[0.2, 0.25, 0.3], index=0, format_func=lambda x: f"{int(x*100)}%")
+    with colB:
+        seed = st.number_input("隨機種子", min_value=1, value=42, step=1)
+    with colC:
+        feat_sel = st.selectbox("特徵選擇方法", options=["kbest", "lasso"], index=0,
+                                format_func=lambda v: "KBest (f_regression)" if v == "kbest" else "L1 / Lasso（自動 α）")
+    with colD:
+        k = st.number_input("K 值（KBest）", min_value=1, value=10, step=1)
+
+    start_btn = st.button("開始訓練", type="primary")
+
+    if start_btn:
+        # 假進度條：增進體驗（不影響實際運算）
+        progress = st.progress(0, text="訓練中...請稍候")
+        for p in [10, 25, 45, 65, 80, 90]:
+            progress.progress(p, text="訓練中...請稍候")
+            time.sleep(0.15)
+
+        try:
+            results = train_and_evaluate(
+                train_clean,
+                test_size=float(test_size),
+                seed=int(seed),
+                feat_sel=feat_sel,
+                k=int(k),
+                target=DEFAULT_TARGET
+            )
+            # 訓練結束
+            progress.progress(100, text="完成！")
+            st.success("✅ 訓練完成！請切換到「📈 訓練結果」分頁查看。")
+            # 儲存於 session_state 以便結果頁顯示
+            st.session_state["results"] = results
+        except Exception as e:
+            progress.empty()
+            st.error(f"❌ 訓練失敗：{e}")
+
+with tab_results:
+    results = st.session_state.get("results")
+    if not results:
+        st.info("尚無結果。請到「⚙️ 訓練設定」分頁執行訓練。")
+    else:
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("訓練樣本", f"{results['n_train']:,}")
+        c2.metric("驗證樣本", f"{results['n_test']:,}")
+        c3.metric("使用特徵數", f"{results['n_features']:,}")
+        c4.metric("MAE", f"{results['mae']:,.2f}")
+        c5.metric("RMSE", f"{results['rmse']:,.2f}")
+        st.metric(label="R²", value=f"{results['r2']:.4f}")
+        st.caption(f"特徵選擇：{results['feat_sel_desc']}｜目標：{results['target']}")
+
+        # Top-10 係數
+        st.subheader("特徵係數（Top 10 by |coef|）")
+        coef_df = pd.DataFrame(results["top_coefs"], columns=["Rank", "Feature", "Coefficient"])
+        st.dataframe(coef_df, use_container_width=True, hide_index=True)
+
+        # 圖
+        st.subheader("Predicted vs Actual（含 95% CI / 95% PI）")
+        st.pyplot(results["figure"], clear_figure=True)
+
+        st.caption("CI = Confidence Interval（平均預測區間）；PI = Prediction Interval（新觀測區間）")
