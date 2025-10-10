@@ -32,6 +32,14 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from scipy import sparse
 from scipy.stats import t as student_t
 
+# 相容新版/舊版 scikit-learn 的 RMSE 計算
+def rmse_compat(y_true, y_pred):
+    try:
+        # 新版：直接用 squared=False 取得 RMSE
+        return mean_squared_error(y_true, y_pred, squared=False)
+    except TypeError:
+        # 舊版：沒有 squared 參數 → 先算 MSE 再開根號
+        return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 基本設定
@@ -236,7 +244,8 @@ def train_and_evaluate(df_clean: pd.DataFrame, *,
 
     # 指標
     mae = mean_absolute_error(yte.values, yhat)
-    rmse = mean_squared_error(yte.values, yhat, squared=False)
+    rmse = rmse_compat(yte.values, yhat)
+
     r2 = r2_score(yte.values, yhat)
 
     # 係數（含截距在 beta[0]）
