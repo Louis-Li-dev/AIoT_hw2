@@ -1,13 +1,13 @@
 # app.py
 # -*- coding: utf-8 -*-
 #
-# 房屋價格預測 Streamlit 應用（現代化 UI + 三分頁）：
+# 房屋價格預測 Streamlit 應用（現代化 UI + 三分頁）
 # - 讀取 dataset/train.csv 與 dataset/test.csv（固定路徑）
 # - 目標：SalePrice
 # - 缺值策略：>50% 缺值之欄位刪除；其餘數值以中位數、類別以眾數
 # - 特徵工程：One-Hot（類別）+ 標準化（數值）
 # - 特徵選擇：KBest(f_regression) 或 L1/Lasso（自動 α）
-# - 模型：statsmodels OLS（提供 95% CI/PI）；失敗則退回 sklearn LinearRegression 並以殘差近似區間
+# - 模型：NumPy 閉式解 OLS（提供 95% CI/PI），完全不依賴 statsmodels
 #
 # 執行：
 #   streamlit run app.py
@@ -27,10 +27,10 @@ from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.feature_selection import SelectKBest, f_regression
-from sklearn.linear_model import LassoCV, LinearRegression
+from sklearn.linear_model import LassoCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from scipy import sparse
-import statsmodels.api as sm
+from scipy.stats import t as student_t
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -119,6 +119,54 @@ def fig_to_png(fig):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# OLS（NumPy 閉式解）計算 95% CI / 95% PI
+# ──────────────────────────────────────────────────────────────────────────────
+def ols_ci_pi_numpy(X_train: np.ndarray, y_train: np.ndarray,
+                    X_test: np.ndarray, alpha: float = 0.05):
+    """
+    以 NumPy（閉式解）計算 OLS 參數、均值預測、95% 信賴區間（CI）與預測區間（PI）。
+    X_* 需為「已完成所有前處理/特徵選擇」後的設計矩陣（不含常數欄）。
+    """
+    # 加上常數項
+    Xtr = np.c_[np.ones((X_train.shape[0], 1)), X_train]
+    Xte = np.c_[np.ones((X_test.shape[0], 1)),  X_test]
+
+    # β̂ = (X'X)^(-1) X'y ；使用 pinv 比 inv 穩定
+    XtX_inv = np.linalg.pinv(Xtr.T @ Xtr)
+    beta_hat = XtX_inv @ (Xtr.T @ y_train)
+
+    # 殘差與殘差方差 s^2 = RSS / (n - p)
+    resid = y_train - Xtr @ beta_hat
+    n, p = Xtr.shape
+    dof = max(n - p, 1)
+    sigma2 = float((resid @ resid) / dof)
+
+    # 預測均值與標準誤
+    y_mean = Xte @ beta_hat
+    # Var(mean) = s^2 * x0' (X'X)^(-1) x0
+    mean_var = np.einsum("ij,jk,ik->i", Xte, XtX_inv, Xte)
+    se_mean = np.sqrt(np.maximum(sigma2 * mean_var, 0.0))
+    # 預測區間 Var(pred) = s^2 * (1 + x0'(X'X)^(-1)x0)
+    se_pred = np.sqrt(np.maximum(sigma2 * (1.0 + mean_var), 0.0))
+
+    # t 臨界值
+    tcrit = float(student_t.ppf(1.0 - alpha / 2.0, dof))
+
+    ci_lo = y_mean - tcrit * se_mean
+    ci_hi = y_mean + tcrit * se_mean
+    pi_lo = y_mean - tcrit * se_pred
+    pi_hi = y_mean + tcrit * se_pred
+
+    return {
+        "beta": beta_hat,          # [intercept, coef...]
+        "y_mean": y_mean,          # 預測均值
+        "ci_lo": ci_lo, "ci_hi": ci_hi,
+        "pi_lo": pi_lo, "pi_hi": pi_hi,
+        "sigma2": sigma2, "dof": dof
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 訓練與評估主流程（可呼叫）
 # ──────────────────────────────────────────────────────────────────────────────
 def train_and_evaluate(df_clean: pd.DataFrame, *,
@@ -180,40 +228,23 @@ def train_and_evaluate(df_clean: pd.DataFrame, *,
     Xte_s = Xte_d[:, selected_idx]
     feat_names_s = [feat_names[i] if i < len(feat_names) else f"f_{i}" for i in selected_idx]
 
-    # OLS 擬合與區間
-    Xtr_sm = sm.add_constant(Xtr_s)
-    Xte_sm = sm.add_constant(Xte_s)
-
-    ols = sm.OLS(ytr.values, Xtr_sm).fit()
-
-    try:
-        pred = ols.get_prediction(Xte_sm).summary_frame(alpha=0.05)
-        yhat = pred["mean"].values
-        ci_lo = pred["mean_ci_lower"].values
-        ci_hi = pred["mean_ci_upper"].values
-        pi_lo = pred["obs_ci_lower"].values
-        pi_hi = pred["obs_ci_upper"].values
-    except Exception:
-        # 退回 sklearn 線性回歸並以殘差近似 CI/PI（視覺用）
-        lr = LinearRegression()
-        lr.fit(Xtr_s, ytr.values)
-        yhat = lr.predict(Xte_s)
-        resid = yte.values - yhat
-        std = float(np.std(resid))
-        ci_lo = yhat - 1.96 * std
-        ci_hi = yhat + 1.96 * std
-        pi_lo = yhat - 1.96 * std * 1.5
-        pi_hi = yhat + 1.96 * std * 1.5
-        # 讓係數可用（擬造 params）
-        ols.params = np.concatenate([[lr.intercept_], lr.coef_])
+    # ── OLS（NumPy 閉式解）與區間計算 ─────────────────────────────
+    ols_out = ols_ci_pi_numpy(Xtr_s, ytr.values, Xte_s, alpha=0.05)
+    yhat  = ols_out["y_mean"]
+    ci_lo = ols_out["ci_lo"]; ci_hi = ols_out["ci_hi"]
+    pi_lo = ols_out["pi_lo"]; pi_hi = ols_out["pi_hi"]
 
     # 指標
     mae = mean_absolute_error(yte.values, yhat)
     rmse = mean_squared_error(yte.values, yhat, squared=False)
     r2 = r2_score(yte.values, yhat)
 
+    # 係數（含截距在 beta[0]）
+    beta = np.asarray(ols_out["beta"]).reshape(-1)
+    intercept = float(beta[0]) if beta.size > 0 else 0.0
+    coefs = np.asarray(beta[1:], dtype=float)
+
     # Top-10 係數
-    coefs = np.array(ols.params[1:])  # 跳過截距
     names = feat_names_s if len(feat_names_s) == len(coefs) else [f"feature_{i}" for i in range(len(coefs))]
     if len(coefs) > 0 and np.any(np.isfinite(coefs)):
         order = np.argsort(-np.abs(coefs))
